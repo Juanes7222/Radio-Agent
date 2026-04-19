@@ -142,3 +142,4 @@ downloads/
 secrets/
 .turbo/
 swagger-output.json
+daemon/
