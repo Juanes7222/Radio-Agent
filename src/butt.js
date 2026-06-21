@@ -1,7 +1,10 @@
 import { execFile, exec } from 'child_process';
 import { promisify }      from 'util';
+import { logger } from './logger.js';
 import fs from 'fs';
 import path from 'path';
+import iconv from 'iconv-lite';
+
 
 const execAsync = promisify(exec);
 const BUTT_EXE = process.env.BUTT_EXE_PATH;
@@ -52,12 +55,20 @@ export const connect     = () => sendCommand(['-s']);
 export const disconnect  = () => sendCommand(['-d']);
 export const toggleMute  = () => sendCommand(['-M']); 
 
-export function updateMetadata(artist, title) {
+export async function updateMetadata(artist, title) {
     const songString = [artist, title].filter(Boolean).join(' - ');
-    return new Promise((resolve, reject) => {
-        execFile(BUTT_CLIENT_EXE, ['-u', songString], { windowsHide: true }, (err) => {
-            if (err) reject(err);
-            else resolve();
-        });
-    });
+
+    await Promise.all([
+        sendCommand(['-u', songString]).catch(err =>
+            console.warn(`butt metadata failed: ${err.message}`)
+        ),
+        fetch(`${BACKEND_URL}/api/station/nowplaying/update`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${BACKEND_SECRET}`,
+            },
+            body: JSON.stringify({ artist, title }),
+        }),
+    ]);
 }

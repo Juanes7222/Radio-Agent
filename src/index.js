@@ -32,6 +32,7 @@ app.get('/butt/status', async (req, res) => {
         state.isStreaming = false;
         state.isMuted     = false;
     }
+    logger.info("Invoice status");
     res.json({ running, isStreaming: state.isStreaming, isMuted: state.isMuted });
 });
 
@@ -72,6 +73,7 @@ app.post('/butt/stop', async (req, res) => {
 
 app.post('/butt/metadata', async (req, res) => {
     const { artist = '', title = '' } = req.body;
+    logger.info(`/butt/metadata called with artist="${artist}" title="${title}"`);
     if (!artist && !title) return res.status(400).json({ error: 'artist or title required' });
     try {
         await butt.updateMetadata(artist, title);
