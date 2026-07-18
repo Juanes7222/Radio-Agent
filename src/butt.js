@@ -10,6 +10,8 @@ const execAsync = promisify(exec);
 const BUTT_EXE = process.env.BUTT_EXE_PATH;
 const BUTT_CLIENT_EXE = path.join(path.dirname(BUTT_EXE), 'butt-client.exe');
 const BUTT_CONFIG = process.env.BUTT_CONFIG_PATH;
+const BACKEND_SECRET = process.env.BACKEND_SECRET
+const BACKEND_URL = process.env.BACKEND_URL
 
 const logDir = path.join(process.cwd(), 'daemon');
 if (!fs.existsSync(logDir)) {
@@ -50,7 +52,7 @@ function sendCommand(args) {
     });
 }
 
-export const launch      = () => spawnDetached([], 4000);
+export const launch      = () => spawnDetached([], 6000);
 export const connect     = () => sendCommand(['-s']);
 export const disconnect  = () => sendCommand(['-d']);
 export const toggleMute  = () => sendCommand(['-M']); 
@@ -58,17 +60,16 @@ export const toggleMute  = () => sendCommand(['-M']);
 export async function updateMetadata(artist, title) {
     const songString = [artist, title].filter(Boolean).join(' - ');
 
-    await Promise.all([
-        sendCommand(['-u', songString]).catch(err =>
-            console.warn(`butt metadata failed: ${err.message}`)
-        ),
+    const results = await Promise.all([
         fetch(`${BACKEND_URL}/api/station/nowplaying/update`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${BACKEND_SECRET}`,
+                'x-webhook-secret': `${BACKEND_SECRET}`,
             },
             body: JSON.stringify({ artist, title }),
         }),
     ]);
+
+    logger.info(`Server response: ${results[0].status} ${results[0].statusText}`);
 }

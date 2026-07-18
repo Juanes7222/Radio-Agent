@@ -84,4 +84,16 @@ app.post('/butt/metadata', async (req, res) => {
     }
 });
 
+app.post('/restart', async (req, res) => {
+    logger.info('Restart requested');
+
+    res.json({
+        restarting: true
+    });
+
+    setTimeout(() => {
+        process.exit(1);
+    }, 100);
+});
+
 app.listen(PORT, () => logger.info(`radio-agent running on port ${PORT}`));
