@@ -143,3 +143,9 @@ secrets/
 .turbo/
 swagger-output.json
 daemon/
+# Stream engine settings written by the panel
+stream-settings.json
+stream-settings.json.tmp
+# Panel-editable runtime configuration (holds the source password and backend secret)
+agent-config.json
+agent-config.json.tmp

@@ -1,21 +1,23 @@
+import { join } from 'node:path';
 import { Service } from 'node-windows';
-import { fileURLToPath } from 'url';
-import { dirname, join }  from 'path';
-import { configDotenv } from 'dotenv';
-configDotenv();
+import { config, ROOT_DIR } from './src/config.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+// node-windows serialises these values into the service wrapper, so only the
+// ones that are really set are passed: an undefined value would be written into
+// the wrapper as the literal string "undefined".
+const env = Object.entries({
+    PORT: config.port,
+    BUTT_EXE_PATH: config.buttExe,
+    BUTT_CONFIG_PATH: config.buttConfig,
+})
+    .filter(([, value]) => value !== '' && value !== undefined && value !== null)
+    .map(([name, value]) => ({ name, value: String(value) }));
 
 const svc = new Service({
-    name:        'RadioAgent',
+    name: 'RadioAgent',
     description: 'La Voz de la Verdad — radio agent for butt control',
-    script:      join(__dirname, 'src', 'index.js'),
-    nodeOptions: [],
-    env: [
-        { name: 'PORT',             value: process.env.PORT },
-        { name: 'BUTT_EXE_PATH',    value: process.env.BUTT_EXE_PATH },
-        { name: 'BUTT_CONFIG_PATH', value: process.env.BUTT_CONFIG_PATH || join(process.env.APPDATA, 'buttrc') },
-    ],
+    script: join(ROOT_DIR, 'src', 'index.js'),
+    env,
 });
 
 svc.on('install', () => {
@@ -31,8 +33,8 @@ svc.on('start', () => {
     console.log('Service started.');
 });
 
-svc.on('error', (err) => {
-    console.error('Error:', err);
+svc.on('error', error => {
+    console.error('Error:', error);
 });
 
 svc.install();

@@ -1,99 +1,65 @@
-import 'dotenv/config';
-import express             from 'express';
-import * as butt           from './butt.js';
-import state               from './state.js';
+// Applied before anything else reads config: the panel's saved overrides win
+// over the .env values.
+import { loadAgentConfig } from './agent-config.js';
+import { config } from './config.js';
 import { logger } from './logger.js';
+import { createServer } from './server.js';
+import { engineName, shutdown as shutdownStream } from './stream/index.js';
 
-process.on('uncaughtException', err => {
-    logger.error(`Uncaught Exception: ${err.message}`, err);
+const SHUTDOWN_GRACE_MS = 3000;
+
+let server = null;
+let shuttingDown = false;
+
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function shutdown(code, reason) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info(`Shutting down (${reason})`);
+
+    if (server) {
+        const closed = new Promise(resolve => server.close(resolve));
+        server.closeIdleConnections?.();
+        // Keep-alive sockets would otherwise hold the process open forever.
+        const forceClose = setTimeout(() => server.closeAllConnections?.(), 500);
+        forceClose.unref();
+        await Promise.race([closed, delay(SHUTDOWN_GRACE_MS)]);
+    }
+
+    // The encoder must not outlive the agent.
+    shutdownStream();
+    await logger.close();
+    process.exit(code);
+}
+
+process.on('uncaughtException', error => {
+    logger.fatal(`Uncaught exception: ${error?.message ?? error}`, error);
+    shutdownStream();
     process.exit(1);
 });
-process.on('unhandledRejection', (reason, promise) => {
-    logger.error(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
+
+process.on('unhandledRejection', reason => {
+    logger.fatal(
+        `Unhandled rejection: ${reason instanceof Error ? reason.message : reason}`,
+        reason instanceof Error ? reason : null,
+    );
+    shutdownStream();
     process.exit(1);
 });
 
-const app  = express();
-const PORT = process.env.PORT ?? 3000;
+process.on('SIGINT', () => shutdown(0, 'SIGINT'));
+process.on('SIGTERM', () => shutdown(0, 'SIGTERM'));
 
-app.use(express.json());
+loadAgentConfig();
 
-app.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin',  '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') return res.sendStatus(204);
-    next();
+const app = createServer({ onRestart: () => shutdown(1, 'restart requested') });
+
+server = app.listen(config.port, () => {
+    logger.info(`radio-agent listening on port ${config.port} (stream engine: ${engineName()})`);
 });
 
-app.get('/butt/status', async (req, res) => {
-    const running = await butt.isRunning();
-    if (!running) {
-        state.isStreaming = false;
-        state.isMuted     = false;
-    }
-    logger.info("Invoice status");
-    res.json({ running, isStreaming: state.isStreaming, isMuted: state.isMuted });
+server.on('error', error => {
+    logger.fatal(`HTTP server error on port ${config.port}: ${error.message}`, error);
+    process.exit(1);
 });
-
-app.post('/butt/launch', async (req, res) => {
-    if (await butt.isRunning()) return res.json({ launched: false, reason: 'already running' });
-    try {
-        await butt.launch();
-        res.json({ launched: true });
-    } catch (err) {
-        logger.error(`Failed to launch butt: ${err.message}`, err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.post('/butt/start', async (req, res) => {
-    try {
-        if (!(await butt.isRunning())) await butt.launch();
-        await butt.connect();
-        state.isStreaming = true;
-        res.json({ ok: true });
-    } catch (err) {
-        logger.error(`Failed to start butt: ${err.message}`, err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.post('/butt/stop', async (req, res) => {
-    try {
-        await butt.disconnect();
-        state.isStreaming = false;
-        state.isMuted     = false;
-        res.json({ ok: true });
-    } catch (err) {
-        logger.error(`Failed to stop butt: ${err.message}`, err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.post('/butt/metadata', async (req, res) => {
-    const { artist = '', title = '' } = req.body;
-    logger.info(`/butt/metadata called with artist="${artist}" title="${title}"`);
-    if (!artist && !title) return res.status(400).json({ error: 'artist or title required' });
-    try {
-        await butt.updateMetadata(artist, title);
-        res.json({ ok: true });
-    } catch (err) {
-        logger.error(`Failed to update metadata: ${err.message}`, err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.post('/restart', async (req, res) => {
-    logger.info('Restart requested');
-
-    res.json({
-        restarting: true
-    });
-
-    setTimeout(() => {
-        process.exit(1);
-    }, 100);
-});
-
-app.listen(PORT, () => logger.info(`radio-agent running on port ${PORT}`));

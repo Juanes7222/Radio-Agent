@@ -1,75 +1,110 @@
-import { execFile, exec } from 'child_process';
-import { promisify }      from 'util';
+import { execFile, spawn } from 'node:child_process';
+import { mkdirSync, openSync } from 'node:fs';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+import { config } from './config.js';
 import { logger } from './logger.js';
-import fs from 'fs';
-import path from 'path';
-import iconv from 'iconv-lite';
 
+const execFileAsync = promisify(execFile);
 
-const execAsync = promisify(exec);
-const BUTT_EXE = process.env.BUTT_EXE_PATH;
-const BUTT_CLIENT_EXE = path.join(path.dirname(BUTT_EXE), 'butt-client.exe');
-const BUTT_CONFIG = process.env.BUTT_CONFIG_PATH;
-const BACKEND_SECRET = process.env.BACKEND_SECRET
-const BACKEND_URL = process.env.BACKEND_URL
+// Opened once for the whole process lifetime: every butt.exe launch inherits
+// these handles, so its output keeps appending to the same two files.
+mkdirSync(config.logDir, { recursive: true });
+const stdoutFd = openSync(join(config.logDir, 'butt-out.log'), 'a');
+const stderrFd = openSync(join(config.logDir, 'butt-err.log'), 'a');
 
-const logDir = path.join(process.cwd(), 'daemon');
-if (!fs.existsSync(logDir)) {
-    fs.mkdirSync(logDir, { recursive: true });
+// The OBS panel polls every 2s; with a shorter TTL every poll would spawn
+// tasklist again, so the cache must outlive one polling cycle.
+const STATUS_TTL_MS = 5000;
+const LAUNCH_POLL_MS = 250;
+
+let cachedStatus = { value: false, at: 0 };
+let pendingStatus = null;
+
+async function queryRunning() {
+    try {
+        const { stdout } = await execFileAsync(
+            'tasklist',
+            ['/FI', `IMAGENAME eq ${config.buttProcessImage}`, '/NH'],
+            { windowsHide: true, timeout: 5000 },
+        );
+        return stdout.toLowerCase().includes(config.buttProcessImage.toLowerCase());
+    } catch (error) {
+        logger.warn(`Could not query ${config.buttProcessImage}: ${error.message}`);
+        return false;
+    }
 }
 
-const outLog = fs.openSync(path.join(logDir, 'butt-out.log'), 'a');
-const errLog = fs.openSync(path.join(logDir, 'butt-err.log'), 'a');
+/**
+ * Checking a process spawns tasklist (tens of milliseconds per call) and the
+ * radio front-end polls the status endpoint, so the result is memoised briefly
+ * and concurrent lookups share a single tasklist call.
+ */
+export function isRunning({ maxAgeMs = STATUS_TTL_MS } = {}) {
+    if (cachedStatus.at !== 0 && Date.now() - cachedStatus.at < maxAgeMs) {
+        return Promise.resolve(cachedStatus.value);
+    }
 
-function spawnDetached(args, delayMs = 500) {
-    return new Promise((resolve, reject) => {
-        if (BUTT_CONFIG) {
-            args = ['-c', BUTT_CONFIG, ...args];
-        }
-        const child = execFile(BUTT_EXE, args, {
-            detached: true,
-            stdio: [ 'ignore', outLog, errLog ],
-            windowsHide: true,
+    pendingStatus ??= queryRunning()
+        .then(value => {
+            cachedStatus = { value, at: Date.now() };
+            return value;
+        })
+        .finally(() => {
+            pendingStatus = null;
         });
-        child.on('error', reject);
-        child.unref();
-        setTimeout(resolve, delayMs);
-    });
+
+    return pendingStatus;
 }
 
-export function isRunning() {
-    return execAsync('tasklist /FI "IMAGENAME eq butt.exe" /NH')
-        .then(({ stdout }) => stdout.toLowerCase().includes('butt.exe'))
-        .catch(() => false);
-}
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function sendCommand(args) {
     return new Promise((resolve, reject) => {
-        execFile(BUTT_CLIENT_EXE, args, { windowsHide: true }, (err) => {
-            if (err) reject(err);
-            else resolve();
-        });
+        execFile(
+            config.buttClientExe,
+            args,
+            { windowsHide: true, timeout: config.commandTimeoutMs },
+            error => (error ? reject(error) : resolve()),
+        );
     });
 }
 
-export const launch      = () => spawnDetached([], 6000);
-export const connect     = () => sendCommand(['-s']);
-export const disconnect  = () => sendCommand(['-d']);
-export const toggleMute  = () => sendCommand(['-M']); 
+/**
+ * Starts butt.exe and waits until the process actually exists instead of
+ * sleeping a fixed amount of time, so the HTTP call returns as soon as the
+ * broadcaster is up.
+ */
+export async function launch() {
+    const args = config.buttConfig ? ['-c', config.buttConfig] : [];
+    const child = spawn(config.buttExe, args, {
+        detached: true,
+        stdio: ['ignore', stdoutFd, stderrFd],
+        windowsHide: true,
+    });
 
-export async function updateMetadata(artist, title) {
-    const songString = [artist, title].filter(Boolean).join(' - ');
+    await new Promise((resolve, reject) => {
+        child.once('error', reject);
+        child.once('spawn', resolve);
+    });
+    child.unref();
 
-    const results = await Promise.all([
-        fetch(`${BACKEND_URL}/api/station/nowplaying/update`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-webhook-secret': `${BACKEND_SECRET}`,
-            },
-            body: JSON.stringify({ artist, title }),
-        }),
-    ]);
+    const deadline = Date.now() + config.launchTimeoutMs;
+    while (Date.now() < deadline) {
+        if (await isRunning({ maxAgeMs: 0 })) return;
+        if (child.exitCode !== null) {
+            throw new Error(`butt.exe exited while starting (code ${child.exitCode})`);
+        }
+        await delay(LAUNCH_POLL_MS);
+    }
 
-    logger.info(`Server response: ${results[0].status} ${results[0].statusText}`);
-}
+    if (child.exitCode !== null) {
+        throw new Error(`butt.exe exited while starting (code ${child.exitCode})`);
+    }
+    // The process is alive but tasklist did not report it: keep the old
+    // "launched" outcome instead of failing a working start.
+    logger.warn(`butt.exe started but was not listed by tasklist within ${config.launchTimeoutMs}ms`);
+    cachedStatus = { value: true, at: Date.now() };
+}export const connect = () => sendCommand(['-s']);
+export const disconnect = () => sendCommand(['-d']);
+
